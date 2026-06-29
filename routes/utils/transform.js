@@ -16,10 +16,13 @@ class Transform {
 
     transform(){
         let idx=this.pos;
+        const docBaseVersion = this.currentState.baseVersion || 0;  // Where ops array starts
+        
         switch(this.type){
             case 'insert':
                 for(let i=this.baseVersion;i<this.version;i++){
-                    const op=this.ops[i];
+                    const op=this.ops[i-docBaseVersion];  // Use document's baseVersion
+                    if(!op) continue;  // Skip if op doesn't exist
                     if(op.type==='insert'){
                         let len=op.text.length;
                         let pos=op.pos;
@@ -35,17 +38,18 @@ class Transform {
                             if(idx<0){
                                 idx=0;
                             }
+                            console.log(`Adjusted idx by -${len} to ${idx}`);
                         }
                     }
                 }
                 const newContent=this.content.slice(0,idx)+this.text+this.content.slice(idx);
-                console.log(newContent); 
-                return newContent;
-                break;
+                console.log('Final idx:', idx, 'Text:', this.text); 
+                return {newContent,idx};
             case 'delete':
                 let deleteLen=this.deleteLen;
                 for(let i=this.baseVersion;i<this.version;i++){
-                    const op=this.ops[i];
+                    const op=this.ops[i-docBaseVersion];  // Use document's baseVersion
+                    if(!op) continue;  // Skip if op doesn't exist
                     if(op.type==='insert'){
                         let len=op.text.length;
                         let pos=op.pos;
@@ -75,8 +79,8 @@ class Transform {
                 }
                 const updatedContent=this.content.slice(0,idx)+this.content.slice(idx+deleteLen);
                 console.log(updatedContent);
-                return updatedContent;
-                break;
+                return {newContent: updatedContent, idx};
+                
         }
     }    
 }
