@@ -15,58 +15,114 @@ async function handleMessage(socket, data){
             await handleJoin(socket,payload);
             break;
         case 'insert':
+            if(socket.role=='VIEWER'){
+                socket.send(JSON.stringify({type:'error',message:'You dont have edit access to this document'}));
+                return;
+            }
             handleinsert(socket,payload);
             break;
         case 'delete':
-            handleDelete(socket,payload);
+            if(socket.role=='VIEWER'){
+                socket.send(JSON.stringify({type:'error',message:'You dont have edit access to this document'}));
+                return;
+            }
+            handleDelete(socket,payload);   
             break;
     }
 
 }  
-async function handleJoin(socket,payload){{
-    const {docId}=payload;
+async function handleJoin(socket,payload){
+    const {docId,userEmail}=payload;
+    if(!documentState.has(docId)){
+        const doc=await prisma.doc.findUnique({
+            where:{id:docId}
+        })
+        if(!doc){
+            socket.send(JSON.stringify({type:'error',message:'Document not found'}));
+            return;
+        }
+        documentState.set(docId, {
+            title: doc.title || 'Untitled Document',
+            content: doc.content || '',
+            version: doc.version || 0,
+            baseVersion: doc.version || 0,  // Track where ops start
+            ops: []
+        });
+    }
     if(!documentClients.has(docId)){
         documentClients.set(docId, new Set());
     }
-    documentClients.get(docId).add(socket);
-    const doc=await prisma.doc.findUnique({
-        where:{id:docId}
+    const user=await prisma.user.findUnique({
+        where:{email:userEmail}
     })
-    if(!doc){
-        socket.send(JSON.stringify({type:'error',message:'Document not found'}));
+    if(!user){
+        socket.send(JSON.stringify({type:'error',message:'User not found'}));
         return;
     }
-    socket.doc=doc;
-    console.log(`User joined: ${docId}`);
-    if(!documentState.has(docId)){
-        documentState.set(docId,{
-            content:doc.content||'',
-            version:0,
-            ops:[]
-        });
-        
+    const access=await prisma.docAccess.findFirst({
+        where:{
+            docId:docId,
+            userId:user.id
+        }
+    })
+    if(!access){
+        socket.send(JSON.stringify({type:'error',message:'You are not allowed to join this document'}));
+        return;
     }
-    
 
-    socket.send(JSON.stringify({type:'join',success:true}));
+    documentClients.get(docId).add(socket);
+
+    socket.docId=docId;
+    socket.userEmail=userEmail;
+    socket.role=access.role;
+    console.log(`User joined: ${docId} ${userEmail}`);
+
+    const onlineUsers = Array.from(documentClients.get(docId)).map(s => s.userEmail);
+    broadcastAll(docId,socket,{type:'join',success:true,payload:{useronline:onlineUsers}});
+    const state = documentState.get(docId);
+    socket.send(JSON.stringify({
+        type:'init',
+        title: state.title,
+        content: state.content,
+        version: state.version,
+        role:socket.role
+    }));
 }
+
+
+// Clean up on disconnect
+function handleDisconnect(socket) {
+    const docId = socket.docId;
+    const userEmail = socket.userEmail;
+    
+    
+    console.log(`Socket disconnected: ${docId} ${userEmail}`);
+    if(documentClients.get(docId)){
+        documentClients.get(docId).delete(socket);
+    }
+        
+    // Broadcast updated user list to remaining clients
+    if(documentClients.get(docId)){
+        const onlineUsers = Array.from(documentClients.get(docId)).map(s => s.userEmail);
+        broadcast(docId, socket, {type:'leave', success:true, payload:{useronline:onlineUsers}});
+    }
 }
+
 async function handleinsert(socket,payload){
     const {docId,pos,text,len,baseVersion}=payload;
     const currentState=documentState.get(docId);
     const currentVersion=currentState.version;
     const currentContent=currentState.content;
     console.log(currentContent);
-    transform=new Transform(currentState,'insert',pos,baseVersion,text);
-    const newContent=transform.transform();
+    const transform=new Transform(currentState,'insert',pos,baseVersion,text);
+    const {newContent,idx}=transform.transform();
     documentState.set(docId,{
         content:newContent,
         version:currentVersion+1,
-        ops:[...currentState.ops, {type:'insert',pos,text}]
+        baseVersion: currentState.baseVersion || 0,  // Preserve baseVersion
+        ops:[...currentState.ops, {type:'insert',pos:idx,text}]
     });
-    console.log(currentVersion+1);
-
-    broadcast(docId,socket, {type:'insert',payload:{pos,text}});
+    broadcast(docId,socket, {type:'insert',payload:{pos:idx,text,version:currentVersion+1}});
 }
 
 async function handleDelete(socket,payload){
@@ -75,18 +131,31 @@ async function handleDelete(socket,payload){
     const currentVersion=currentState.version;
     const currentContent=currentState.content;
     console.log('currentContent:', currentContent);
-    transform=new Transform(currentState,'delete',pos,baseVersion,'',len);
-    const newContent=transform.transform();
+    const transform=new Transform(currentState,'delete',pos,baseVersion,'',len);
+    const {newContent,idx}=transform.transform(); 
     console.log(newContent);
     documentState.set(docId,{
         content:newContent,
         version:currentVersion+1,
-        ops:[...currentState.ops, {type:'delete',pos,len}]
+        baseVersion: currentState.baseVersion,  // Preserve baseVersion
+        ops:[...currentState.ops, {type:'delete',pos:idx,len}]
     });
 
-    broadcast(docId,socket, {type:'delete',payload:{pos,len}});
+    broadcast(docId,socket, {type:'delete',payload:{pos:idx,len,version:currentVersion+1}});
 }
 
+async function handleSave(docId){
+    const currentState=documentState.get(docId);
+    await prisma.doc.update({
+        where:{id:docId},
+        data:{content:currentState.content,version:currentState.version}
+    });
+}
+setInterval(async ()=>{
+    for(const docId of documentState.keys()){
+        await handleSave(docId);
+    }
+},10000);
 
 function broadcast(docId, senderSocket, message) {
     const clients = documentClients.get(docId) || new Set();
@@ -95,8 +164,19 @@ function broadcast(docId, senderSocket, message) {
         client.send(JSON.stringify(message));
       }
     });
-  }
+}
+function broadcastAll(docId, senderSocket, message) {
+    const clients = documentClients.get(docId) || new Set();
+    clients.forEach(client => {
+      if (client.readyState === 1) {
+        client.send(JSON.stringify(message));
+      }
+    });
+}
 module.exports = handleMessage;
+module.exports.handleDisconnect = handleDisconnect;
+module.exports.documentState = documentState;
+module.exports.broadcastAll = broadcastAll;
 
 
 
