@@ -2,27 +2,14 @@ const express = require('express');
 const router = express.Router();
 const { PrismaClient, Role } = require('../generated/prisma');
 const { documentState, broadcastAll } = require('./op.js');
+const authMiddleware = require('../middleware/auth_middleware');
 
 const prisma = new PrismaClient();
 
-router.post('/create', async (req,res)=>{
-    const {title, content, ownerEmail}=req.body;  // Frontend sends email
-    console.log(title, content, ownerEmail);
+router.post('/create', authMiddleware, async (req,res)=>{
+    const {title, content} = req.body;
     
     try{
-        // Step 1: Find user by email and get their UUID
-        const owner = await prisma.user.findUnique({
-            where: { email: ownerEmail }
-        });
-        
-        if (!owner) {
-            return res.status(400).json({
-                success: false, 
-                error: 'Owner not found. Please provide a valid email address.'
-            });
-        }
-        
-        // Step 2: Create document using the UUID (owner.id)
         const doc=await prisma.doc.create({
             data:{
                 title,
@@ -33,7 +20,7 @@ router.post('/create', async (req,res)=>{
             data:{
                 role:Role.OWNER,
                 docId:doc.id,
-                userId:owner.id
+                userId:req.userId
             }
         })
         
@@ -42,22 +29,14 @@ router.post('/create', async (req,res)=>{
         res.status(500).json({success:false,error:error.message})
     }
 })
-router.get('/', async (req,res)=>{
+router.get('/', authMiddleware, async (req,res)=>{
     try{
-        const {userEmail}=req.query;  // Changed from req.body to req.query
-        const user=await prisma.user.findUnique({
-            where:{email:userEmail}
-        })
-        if(!user){
-            return res.status(404).json({success:false,error:'User not found'})
-        }
         const docAccess=await prisma.docAccess.findMany({
-            where:{userId:user.id},
+            where:{userId:req.userId},
             include:{
-                doc:true  // Include the full document details
+                doc:true
             }
         })
-        // Transform to return docs with role information
         const docs = docAccess.map(access => ({
             ...access.doc,
             role: access.role
@@ -67,8 +46,9 @@ router.get('/', async (req,res)=>{
         res.status(500).json({success:false,error:error.message})
     }
 })
-router.get('/:id', async (req,res)=>{
+router.get('/:id', authMiddleware, async (req,res)=>{
     const {id}=req.params;
+    const userId=req.userId;
     try{
         const doc=await prisma.doc.findUnique({
             where:{id}
@@ -76,15 +56,37 @@ router.get('/:id', async (req,res)=>{
         if(!doc){
             return res.status(404).json({success:false,message:'Document not found'})
         }
+        const access=await prisma.docAccess.findUnique({
+            where:{
+                docId_userId:{
+                    docId:id,
+                    userId:userId
+                }
+            }
+        })
+        if(!access){
+            return res.status(403).json({success:false,message:'You are not allowed to access this document'})
+        }
         res.status(200).json({success:true,doc})
     }catch(error){
         res.status(500).json({success:false,error:error.message})
     }
 })
 
-router.delete('/delete/:id', async (req,res)=>{
+router.delete('/delete/:id', authMiddleware, async (req,res)=>{
     const {id}=req.params;
     try{
+        const access=await prisma.docAccess.findUnique({
+            where:{
+                docId_userId:{
+                    docId:id,
+                    userId:req.userId
+                }
+            }
+        })
+        if(!access || access.role!==Role.OWNER){
+            return res.status(403).json({success:false,message:'You are not allowed to delete this document'})
+        }
         const doc=await prisma.doc.delete({
             where:{id}
         })
@@ -94,16 +96,26 @@ router.delete('/delete/:id', async (req,res)=>{
         res.status(500).json({success:false,error:error.message})
     }
 })
-router.put('/update/:id', async (req,res)=>{
+router.put('/update/:id', authMiddleware, async (req,res)=>{
     const {id}=req.params;
     const {title}=req.body;
     try{
+        const access=await prisma.docAccess.findUnique({
+            where:{
+                docId_userId:{
+                    docId:id,
+                    userId:req.userId
+                }
+            }
+        })
+        if(!access || access.role!==Role.OWNER){
+            return res.status(403).json({success:false,message:'You are not allowed to update this document'})
+        }
         const doc=await prisma.doc.update({
             where:{id},
             data:{title}
         })
         
-        // Update documentState if doc is currently open
         if(documentState.has(id)){
             const state = documentState.get(id);
             documentState.set(id, {
@@ -111,7 +123,6 @@ router.put('/update/:id', async (req,res)=>{
                 title: title
             });
             
-            // Broadcast title change to all connected users
             broadcastAll(id, null, {
                 type: 'titleUpdate',
                 title: title
@@ -125,14 +136,19 @@ router.put('/update/:id', async (req,res)=>{
     }
 })
 
-router.post('/share', async (req,res)=>{
+router.post('/share', authMiddleware, async (req,res)=>{
     const {docId, email, role}=req.body;
     try{
-        const doc=await prisma.doc.findUnique({
-            where:{id:docId}
+        const access=await prisma.docAccess.findUnique({
+            where:{
+                docId_userId:{
+                    docId:docId,
+                    userId:req.userId
+                }
+            }
         })
-        if(!doc){
-            return res.status(404).json({success:false,message:'Document not found'})
+        if(!access || access.role!==Role.OWNER){
+            return res.status(403).json({success:false,message:'You are not allowed to share this document'})
         }
         const user=await prisma.user.findUnique({
             where:{email}

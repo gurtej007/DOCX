@@ -1,15 +1,20 @@
 const { WebSocketServer } = require('ws');
 const { PrismaClient } = require('../generated/prisma');
 const { Transform } = require('./utils/transform.js'); 
+const jwt = require('jsonwebtoken');
 const prisma = new PrismaClient();
 const documentClients = new Map();  
 const documentState = new Map();
 
 async function handleMessage(socket, data){
-
-    console.log(data);
     const {type,payload}=JSON.parse(data);
-    console.log(socket);
+
+    // Allow join without auth, but block everything else if not joined
+    if(type !== 'join' && !socket.role){
+        socket.send(JSON.stringify({type:'error',message:'You must join a document first'}));
+        return;
+    }
+
     switch(type){
         case 'join':
             await handleJoin(socket,payload);
@@ -29,10 +34,26 @@ async function handleMessage(socket, data){
             handleDelete(socket,payload);   
             break;
     }
-
 }  
 async function handleJoin(socket,payload){
-    const {docId,userEmail}=payload;
+    const {docId, token}=payload;
+
+    // Verify JWT token
+    if(!token){
+        socket.send(JSON.stringify({type:'error',message:'No token provided'}));
+        socket.close();
+        return;
+    }
+    let decoded;
+    try{
+        decoded = jwt.verify(token, process.env.JWT_SECRET);
+    }catch(e){
+        socket.send(JSON.stringify({type:'error',message:'Invalid or expired token'}));
+        socket.close();
+        return;
+    }
+    const userEmail = decoded.email;
+    const userId = decoded.userId;
     if(!documentState.has(docId)){
         const doc=await prisma.doc.findUnique({
             where:{id:docId}
@@ -53,7 +74,7 @@ async function handleJoin(socket,payload){
         documentClients.set(docId, new Set());
     }
     const user=await prisma.user.findUnique({
-        where:{email:userEmail}
+        where:{id:userId}
     })
     if(!user){
         socket.send(JSON.stringify({type:'error',message:'User not found'}));
