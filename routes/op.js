@@ -6,12 +6,41 @@ const prisma = new PrismaClient();
 const documentClients = new Map();  
 const documentState = new Map();
 
+function rejectIfTokenExpired(socket) {
+    if (!socket.exp || Math.floor(Date.now() / 1000) < socket.exp) {
+        return false;
+    }
+    if (socket.readyState === 1) {
+        socket.send(JSON.stringify({ type: 'error', message: 'Invalid or expired token' }));
+    }
+    socket.close();
+    return true;
+}
+
+function scheduleSocketExpiry(socket) {
+    if (socket.expiryTimer) {
+        clearTimeout(socket.expiryTimer);
+    }
+    const msLeft = socket.exp * 1000 - Date.now();
+    if (msLeft <= 0) {
+        rejectIfTokenExpired(socket);
+        return;
+    }
+    socket.expiryTimer = setTimeout(() => {
+        rejectIfTokenExpired(socket);
+    }, msLeft);
+}
+
 async function handleMessage(socket, data){
     const {type,payload}=JSON.parse(data);
 
     // Allow join without auth, but block everything else if not joined
     if(type !== 'join' && !socket.role){
         socket.send(JSON.stringify({type:'error',message:'You must join a document first'}));
+        return;
+    }
+
+    if(type !== 'join' && rejectIfTokenExpired(socket)){
         return;
     }
 
@@ -96,6 +125,8 @@ async function handleJoin(socket,payload){
     socket.docId=docId;
     socket.userEmail=userEmail;
     socket.role=access.role;
+    socket.exp=decoded.exp;
+    scheduleSocketExpiry(socket);
     console.log(`User joined: ${docId} ${userEmail}`);
 
     const onlineUsers = Array.from(documentClients.get(docId)).map(s => s.userEmail);
@@ -113,6 +144,10 @@ async function handleJoin(socket,payload){
 
 // Clean up on disconnect
 function handleDisconnect(socket) {
+    if (socket.expiryTimer) {
+        clearTimeout(socket.expiryTimer);
+        socket.expiryTimer = null;
+    }
     const docId = socket.docId;
     const userEmail = socket.userEmail;
     
